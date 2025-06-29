@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -143,4 +144,43 @@ func StartCleanupRoutine(dir string, interval time.Duration, maxFileAge time.Dur
 			}
 		}
 	}()
+}
+
+func PurgeOrphanedAudioFiles(guildID, channelID string) {
+	files, err := os.ReadDir(CacheDir)
+	if err != nil {
+		log.Printf("Failed to read cache dir: %v", err)
+		return
+	}
+
+	GlobalQueue.Lock()
+	defer GlobalQueue.Unlock()
+
+	validFiles := make(map[string]struct{})
+
+	if current, ok := GlobalQueue.GetCurrentlyPlaying(guildID); ok && current.Title != "" {
+		if path, found := GlobalQueue.GetDownloadedFile(current.Title); found {
+			validFiles[path] = struct{}{}
+		}
+	}
+
+	for _, track := range GlobalQueue.queues[channelID] {
+		if path, found := GlobalQueue.GetDownloadedFile(track.Title); found {
+			validFiles[path] = struct{}{}
+		}
+	}
+
+	for _, entry := range files {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".mp3") {
+			continue
+		}
+		fullPath := filepath.Join(CacheDir, entry.Name())
+		if _, keep := validFiles[fullPath]; !keep {
+			if err := os.Remove(fullPath); err != nil {
+				log.Printf("Failed to delete orphaned file %s: %v", fullPath, err)
+			} else {
+				log.Printf("Deleted orphaned file: %s", fullPath)
+			}
+		}
+	}
 }

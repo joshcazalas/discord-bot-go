@@ -87,6 +87,22 @@ func init() {
 			},
 			Handler: HandleSkipCommand,
 		},
+		"skipuser": {
+			Command: &discordgo.ApplicationCommand{
+				Name:        "skipuser",
+				Description: "Skip all songs queued by a specific user",
+				Options: []*discordgo.ApplicationCommandOption{
+					{
+						Type:         discordgo.ApplicationCommandOptionUser,
+						Name:         "user",
+						Description:  "The user whose songs should be skipped",
+						Required:     true,
+						Autocomplete: true,
+					},
+				},
+			},
+			Handler: HandleSkipUserCommand,
+		},
 		"stop": {
 			Command: &discordgo.ApplicationCommand{
 				Name:        "stop",

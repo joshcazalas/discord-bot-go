@@ -70,6 +70,9 @@ func (q *Queue) Add(discord *discordgo.Session, interaction *discordgo.Interacti
 				log.Printf("Failed to join voice channel immediately: %v", err)
 			} else {
 				StartIdleMonitor(guildID, channelID, discord)
+
+				// Launch playback loop once per guild after joining
+				go playbackLoop(discord, guildID, channelID)
 			}
 		} else {
 			log.Printf("User %s is not in a voice channel, cannot join immediately", userID)
@@ -106,7 +109,7 @@ func (q *Queue) Add(discord *discordgo.Session, interaction *discordgo.Interacti
 			log.Printf("Failed to send follow-up message: %v", err2)
 		}
 
-		StartPlaybackIfNotActive(discord, guildID, channelID)
+		SignalNewTrack(guildID)
 	}(video)
 }
 

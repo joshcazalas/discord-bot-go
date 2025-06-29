@@ -20,4 +20,5 @@ func RegisterAutocompleteHandler(commandName string, handler AutocompleteHandler
 
 func RegisterAutocompleteHandlers() {
 	RegisterAutocompleteHandler("shuffle", HandleShuffleAutocomplete)
+	RegisterAutocompleteHandler("skipuser", HandleSkipUserAutocomplete)
 }

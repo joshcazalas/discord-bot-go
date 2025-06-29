@@ -1,152 +1,153 @@
 package bot
 
-import (
-	"fmt"
-	"log"
-	"os"
-	"time"
+/*******************************************************************************
+ * This is very experimental code and probably a long way from perfect or
+ * ideal.  Please provide feed back on areas that would improve performance
+ *
+ */
 
-	"github.com/bwmarrin/dgvoice"
+// Package dgvoice provides opus encoding and audio file playback for the
+// Discordgo package.
+
+import (
+	"bufio"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strconv"
+	"sync"
+
 	"github.com/bwmarrin/discordgo"
+	"layeh.com/gopus"
 )
 
-func findUserVoiceChannel(discord *discordgo.Session, guildID, userID string) string {
-	guild, err := discord.State.Guild(guildID)
+// NOTE: This API is not final and these are likely to change.
+
+// Technically the below settings can be adjusted however that poses
+// a lot of other problems that are not handled well at this time.
+// These below values seem to provide the best overall performance
+const (
+	channels  int = 2                   // 1 for mono, 2 for stereo
+	frameRate int = 48000               // audio sampling rate
+	frameSize int = 960                 // uint16 size of each audio frame
+	maxBytes  int = (frameSize * 2) * 2 // max size of opus data
+)
+
+var OnError = func(str string, err error) {
+	prefix := "dgVoice: " + str
 	if err != nil {
-		log.Printf("Failed to fetch guild state: %v", err)
-		return ""
+		fmt.Fprintf(os.Stderr, "%s: %v\n", prefix, err)
+	} else {
+		fmt.Fprintln(os.Stderr, prefix)
 	}
-
-	for _, vs := range guild.VoiceStates {
-		if vs.UserID == userID {
-			return vs.ChannelID
-		}
-	}
-
-	log.Printf("User %s is not in a voice channel", userID)
-	return ""
 }
 
-func JoinVoiceChannel(discord *discordgo.Session, guildID, channelID string) error {
-	vc, err := discord.ChannelVoiceJoin(guildID, channelID, false, true)
-	if err != nil {
-		return fmt.Errorf("failed to join voice channel: %w", err)
+func SendPCM(v *discordgo.VoiceConnection, pcm <-chan []int16) {
+	if pcm == nil {
+		return
 	}
 
-	GlobalQueue.SaveVoiceConnection(guildID, vc)
-	GlobalQueue.SetInVoiceChannel(guildID, true)
+	opusEncoder, err := gopus.NewEncoder(frameRate, channels, gopus.Audio)
+	if err != nil {
+		OnError("NewEncoder Error", err)
+		return
+	}
 
-	return nil
+	for recv := range pcm {
+		opus, err := opusEncoder.Encode(recv, frameSize, maxBytes)
+		if err != nil {
+			OnError("Encoding Error", err)
+			return
+		}
+		if !v.Ready || v.OpusSend == nil {
+			return
+		}
+		v.OpusSend <- opus
+	}
 }
 
-func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID string) {
-	if GlobalQueue.IsPlaying(guildID) {
-		log.Printf("Already playing in guild %s, skipping duplicate call", guildID)
+// PlayAudioFile will play the given filename to the already connected
+// Discord voice server/channel.  voice websocket and udp socket
+// must already be setup before this will work.
+func PlayAudioFile(v *discordgo.VoiceConnection, filename string, stop <-chan bool) {
+	run := exec.Command("ffmpeg", "-i", filename, "-f", "s16le", "-ar", strconv.Itoa(frameRate), "-ac", strconv.Itoa(channels), "pipe:1")
+	ffmpegout, err := run.StdoutPipe()
+	if err != nil {
+		OnError("StdoutPipe Error", err)
 		return
 	}
 
-	var next VideoInfo
-	var ok bool
+	ffmpegbuf := bufio.NewReaderSize(ffmpegout, 16384)
 
-	if GlobalQueue.IsShuffleEnabled(textChannelID) {
-		next, ok = GlobalQueue.PopRandom(textChannelID)
-		if !ok {
-			log.Printf("Queue for channel %s is empty, nothing to play", textChannelID)
-			GlobalQueue.SetInVoiceChannel(guildID, false)
-			return
-		}
-	} else {
-		next, ok = GlobalQueue.Peek(textChannelID)
-		if !ok {
-			log.Printf("Queue for channel %s is empty, nothing to play", textChannelID)
-			GlobalQueue.SetInVoiceChannel(guildID, false)
-			return
-		}
-	}
-
-	vc, ok := GlobalQueue.GetVoiceConnection(guildID)
-	if !ok || vc == nil {
-		ErrorChan <- GuildError{
-			GuildID: guildID,
-			Err:     fmt.Errorf("no voice connection found for guild %s", guildID),
-		}
+	err = run.Start()
+	if err != nil {
+		OnError("RunStart Error", err)
 		return
 	}
 
-	var current VideoInfo
-	if GlobalQueue.IsShuffleEnabled(textChannelID) {
-		current = next
-	} else {
-		current, ok = GlobalQueue.Pop(textChannelID)
-		if !ok {
-			log.Printf("Queue for channel %s is empty, nothing to play", textChannelID)
-			GlobalQueue.SetInVoiceChannel(guildID, false)
-			return
-		}
-	}
-
-	GlobalQueue.SetCurrentlyPlaying(guildID, current)
-	GlobalQueue.SetPlaying(guildID, true)
-
-	SendNowPlayingEmbed(discord, textChannelID, current)
-
-	currentPath, found := GlobalQueue.GetDownloadedFile(current.Title)
-	if !found {
-		log.Printf("File for '%s' not found — skipping and removing from queue", current.Title)
-		GlobalQueue.RemoveByTitle(textChannelID, current.Title)
-		ErrorChan <- GuildError{
-			GuildID: guildID,
-			Err:     fmt.Errorf("next track '%s' not ready yet. File not found. Skipping to the next song in the queue... ", current.Title),
-		}
-		StartPlaybackIfNotActive(discord, guildID, textChannelID)
-		return
-	}
-
-	log.Printf("Starting playback of file %s in guild %s", currentPath, guildID)
-	GlobalQueue.SetLastActivity(guildID)
-
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				GlobalQueue.SetLastActivity(guildID)
-			case <-done:
-				return
-			}
+	defer func() {
+		if run.Process != nil {
+			_ = run.Process.Kill()
+			_ = run.Wait()
 		}
 	}()
 
-	stop := make(chan bool)
-	GlobalQueue.Lock()
-	GlobalQueue.stopChans[guildID] = stop
-	GlobalQueue.Unlock()
+	// Create channels to manage shutdown
+	send := make(chan []int16, 2)
+	done := make(chan struct{})
+	defer close(send)
 
-	dgvoice.PlayAudioFile(vc, currentPath, stop)
+	// Kill ffmpeg and stop sending PCM when signaled
+	go func() {
+		select {
+		case <-stop:
+			_ = run.Process.Kill()
+		case <-done:
+			// playback finished naturally
+		}
+	}()
 
-	GlobalQueue.Lock()
-	delete(GlobalQueue.stopChans, guildID)
-	GlobalQueue.Unlock()
-	close(stop)
+	err = v.Speaking(true)
+	if err != nil {
+		OnError("Couldn't set speaking", err)
+	}
+	defer func() {
+		err := v.Speaking(false)
+		if err != nil {
+			OnError("Couldn't stop speaking", err)
+		}
+	}()
+
+	// Run SendPCM in a goroutine and wait for it to finish
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		SendPCM(v, send)
+	}()
+
+playback:
+	for {
+		audiobuf := make([]int16, frameSize*channels)
+		err = binary.Read(ffmpegbuf, binary.LittleEndian, &audiobuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			OnError("error reading from ffmpeg stdout", err)
+			break
+		}
+
+		select {
+		case send <- audiobuf:
+		case <-stop:
+			break playback
+		}
+	}
+
+	// Signal SendPCM to exit and wait
 	close(done)
-
-	log.Printf("Finished playing file %s in guild %s", currentPath, guildID)
-
-	GlobalQueue.SetPlaying(guildID, false)
-	GlobalQueue.SetCurrentlyPlaying(guildID, VideoInfo{})
-
-	if err := os.Remove(currentPath); err != nil {
-		log.Printf("Failed to delete file %s: %v", currentPath, err)
-	}
-
-	next, ok = GlobalQueue.Peek(textChannelID)
-	if !ok {
-		log.Printf("No next track in queue for channel %s", textChannelID)
-		return
-	}
-
-	log.Printf("Queuing next track: %s", next.Title)
-	StartPlaybackIfNotActive(discord, guildID, textChannelID)
+	wg.Wait()
 }
